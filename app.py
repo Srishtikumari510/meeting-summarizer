@@ -1,4 +1,4 @@
-"""Meeting Summarizer Pro - Enterprise Edition with Authentication & Landing Page"""
+"""Meeting Summarizer Pro - Enterprise Edition with Authentication & Database"""
 import streamlit as st
 import os
 from dotenv import load_dotenv
@@ -6,15 +6,119 @@ import tempfile
 from pathlib import Path
 import time
 from google import genai
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import hashlib
-import base64
-from streamlit_extras.switch_page_button import switch_page
-from streamlit_extras.stylable_container import stylable_container
-import pandas as pd
+import bcrypt
+import jwt
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
 load_dotenv()
+
+# ============================================
+# DATABASE SETUP
+# ============================================
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///meeting_summarizer.db")
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# ============================================
+# DATABASE MODELS
+# ============================================
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    username = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=True)
+    full_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_login = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    is_admin = Column(Boolean, default=False)
+    plan = Column(String, default="free")
+    google_id = Column(String, unique=True, nullable=True)
+    profile_pic = Column(String, nullable=True)
+
+class Summary(Base):
+    __tablename__ = "summaries"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    title = Column(String, nullable=True)
+    transcript = Column(Text, nullable=True)
+    summary = Column(Text, nullable=True)
+    audio_filename = Column(String, nullable=True)
+    file_type = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    meeting_date = Column(DateTime, nullable=True)
+    duration_minutes = Column(Integer, nullable=True)
+    action_items = Column(Text, nullable=True)
+    decisions = Column(Text, nullable=True)
+    participants = Column(Text, nullable=True)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# ============================================
+# AUTHENTICATION UTILITIES
+# ============================================
+JWT_SECRET = os.getenv("JWT_SECRET", "your-super-secret-key-change-in-production")
+JWT_ALGORITHM = "HS256"
+TOKEN_EXPIRY_HOURS = 24
+
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+def verify_password(password: str, password_hash: str) -> bool:
+    if not password_hash:
+        return False
+    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+
+def create_jwt_token(user_id: int, email: str) -> str:
+    payload = {
+        "user_id": user_id,
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(hours=TOKEN_EXPIRY_HOURS),
+        "iat": datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def get_user_by_email(db, email: str):
+    return db.query(User).filter(User.email == email).first()
+
+def get_user_by_id(db, user_id: int):
+    return db.query(User).filter(User.id == user_id).first()
+
+def create_user(db, email: str, username: str, password: str = None, full_name: str = None):
+    password_hash = hash_password(password) if password else None
+    user = User(
+        email=email,
+        username=username,
+        password_hash=password_hash,
+        full_name=full_name or username,
+        created_at=datetime.utcnow(),
+        is_active=True
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+def authenticate_user(db, email: str, password: str):
+    user = get_user_by_email(db, email)
+    if not user:
+        return None
+    if not user.password_hash:
+        return None
+    if not verify_password(password, user.password_hash):
+        return None
+    return user
 
 # ============================================
 # PAGE CONFIGURATION
@@ -31,10 +135,14 @@ st.set_page_config(
 # ============================================
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
+if 'user_id' not in st.session_state:
+    st.session_state.user_id = None
 if 'user_email' not in st.session_state:
     st.session_state.user_email = None
 if 'user_name' not in st.session_state:
     st.session_state.user_name = None
+if 'user_plan' not in st.session_state:
+    st.session_state.user_plan = "free"
 if 'page' not in st.session_state:
     st.session_state.page = "landing"
 if 'summary_history' not in st.session_state:
@@ -43,6 +151,10 @@ if 'meeting_count' not in st.session_state:
     st.session_state.meeting_count = 0
 if 'current_summary' not in st.session_state:
     st.session_state.current_summary = None
+if 'db' not in st.session_state:
+    st.session_state.db = SessionLocal()
+if 'token' not in st.session_state:
+    st.session_state.token = None
 
 # ============================================
 # DESIGN TOKENS
@@ -66,7 +178,7 @@ DESIGN_TOKENS = {
 }
 
 # ============================================
-# CUSTOM CSS - COMPLETE LANDING PAGE STYLES
+# CUSTOM CSS
 # ============================================
 def load_css():
     st.markdown(f"""
@@ -82,9 +194,6 @@ def load_css():
             background-color: {DESIGN_TOKENS["primary_background"]};
         }}
         
-        /* ==========================================
-           LANDING PAGE - HERO SECTION
-           ========================================== */
         .hero-section {{
             background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
             padding: 4rem 2rem;
@@ -93,22 +202,6 @@ def load_css():
             text-align: center;
             position: relative;
             overflow: hidden;
-        }}
-        
-        .hero-section::before {{
-            content: '';
-            position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle at 30% 50%, rgba(255,255,255,0.1) 0%, transparent 50%);
-            animation: shimmer 8s ease-in-out infinite;
-        }}
-        
-        @keyframes shimmer {{
-            0%, 100% {{ transform: translate(0, 0); }}
-            50% {{ transform: translate(10%, 10%); }}
         }}
         
         .hero-title {{
@@ -139,53 +232,6 @@ def load_css():
             margin-right: auto;
         }}
         
-        .hero-buttons {{
-            display: flex;
-            gap: 1rem;
-            justify-content: center;
-            position: relative;
-            z-index: 1;
-            flex-wrap: wrap;
-        }}
-        
-        .hero-buttons .primary-btn {{
-            background: white;
-            color: #667eea !important;
-            padding: 0.8rem 2.5rem;
-            border-radius: 50px;
-            font-weight: 600;
-            border: none;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-            text-decoration: none;
-            display: inline-block;
-        }}
-        
-        .hero-buttons .primary-btn:hover {{
-            transform: translateY(-3px);
-            box-shadow: 0 8px 30px rgba(0,0,0,0.2);
-        }}
-        
-        .hero-buttons .secondary-btn {{
-            background: rgba(255,255,255,0.2);
-            color: white !important;
-            padding: 0.8rem 2.5rem;
-            border-radius: 50px;
-            font-weight: 600;
-            border: 2px solid rgba(255,255,255,0.3);
-            cursor: pointer;
-            transition: all 0.3s ease;
-            text-decoration: none;
-            display: inline-block;
-        }}
-        
-        .hero-buttons .secondary-btn:hover {{
-            background: rgba(255,255,255,0.3);
-            transform: translateY(-3px);
-        }}
-        
-        /* Stats Section */
         .stats-section {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -215,7 +261,6 @@ def load_css():
             font-weight: 500;
         }}
         
-        /* Feature Cards */
         .features-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
@@ -257,114 +302,11 @@ def load_css():
             line-height: 1.6;
         }}
         
-        /* Testimonial Section */
-        .testimonial-section {{
-            background: {DESIGN_TOKENS["surface_background"]};
-            padding: 3rem 2rem;
-            border-radius: 16px;
-            margin: 2rem 0;
-            border: 1px solid {DESIGN_TOKENS["border_color"]};
-        }}
-        
-        .testimonial-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1.5rem;
-            margin-top: 1.5rem;
-        }}
-        
-        .testimonial-card {{
-            padding: 1.5rem;
-            border-radius: 12px;
-            background: {DESIGN_TOKENS["primary_background"]};
-            border-left: 4px solid {DESIGN_TOKENS["primary_action"]};
-        }}
-        
-        .testimonial-card .quote {{
-            font-style: italic;
-            color: {DESIGN_TOKENS["primary_text"]};
-            margin-bottom: 0.5rem;
-        }}
-        
-        .testimonial-card .author {{
-            font-weight: 600;
-            color: {DESIGN_TOKENS["heading_color"]};
-        }}
-        
-        .testimonial-card .role {{
-            color: {DESIGN_TOKENS["secondary_text"]};
-            font-size: 0.85rem;
-        }}
-        
-        /* Pricing Section */
-        .pricing-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 1.5rem;
-            margin: 2rem 0;
-        }}
-        
-        .pricing-card {{
-            background: {DESIGN_TOKENS["surface_background"]};
-            padding: 2rem;
-            border-radius: 16px;
-            text-align: center;
-            border: 2px solid {DESIGN_TOKENS["border_color"]};
-            transition: all 0.3s ease;
-        }}
-        
-        .pricing-card:hover {{
-            transform: translateY(-5px);
-            box-shadow: 0 10px 40px rgba(0,0,0,0.08);
-        }}
-        
-        .pricing-card.featured {{
-            border-color: {DESIGN_TOKENS["primary_action"]};
-            background: linear-gradient(135deg, #f8faff, #eef2ff);
-        }}
-        
-        .pricing-card .price {{
-            font-size: 2.5rem;
-            font-weight: 800;
-            color: {DESIGN_TOKENS["heading_color"]};
-        }}
-        
-        .pricing-card .price span {{
-            font-size: 1rem;
-            font-weight: 400;
-            color: {DESIGN_TOKENS["secondary_text"]};
-        }}
-        
-        .pricing-card .plan-name {{
-            font-size: 1.2rem;
-            font-weight: 600;
-            color: {DESIGN_TOKENS["heading_color"]};
-            margin-bottom: 0.5rem;
-        }}
-        
-        .pricing-card ul {{
-            list-style: none;
-            padding: 0;
-            text-align: left;
-            margin: 1rem 0;
-        }}
-        
-        .pricing-card ul li {{
-            padding: 0.5rem 0;
-            color: {DESIGN_TOKENS["primary_text"]};
-            border-bottom: 1px solid {DESIGN_TOKENS["border_color"]};
-        }}
-        
-        .pricing-card ul li::before {{
-            content: '✅ ';
-        }}
-        
-        /* Auth Modal */
         .auth-modal {{
             background: {DESIGN_TOKENS["surface_background"]};
             padding: 2.5rem;
             border-radius: 16px;
-            max-width: 400px;
+            max-width: 500px;
             margin: 2rem auto;
             box-shadow: 0 20px 60px rgba(0,0,0,0.15);
             border: 1px solid {DESIGN_TOKENS["border_color"]};
@@ -384,7 +326,7 @@ def load_css():
             margin-bottom: 1.5rem;
         }}
         
-        .auth-modal .google-btn {{
+        .google-btn {{
             background: white;
             color: #333 !important;
             border: 2px solid {DESIGN_TOKENS["border_color"]};
@@ -400,36 +342,11 @@ def load_css():
             gap: 0.5rem;
         }}
         
-        .auth-modal .google-btn:hover {{
+        .google-btn:hover {{
             background: #f8f9fa;
             border-color: {DESIGN_TOKENS["primary_action"]};
         }}
         
-        .auth-modal .divider {{
-            text-align: center;
-            margin: 1rem 0;
-            color: {DESIGN_TOKENS["secondary_text"]};
-            position: relative;
-        }}
-        
-        .auth-modal .divider::before {{
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 0;
-            right: 0;
-            height: 1px;
-            background: {DESIGN_TOKENS["border_color"]};
-        }}
-        
-        .auth-modal .divider span {{
-            background: white;
-            padding: 0 1rem;
-            position: relative;
-            z-index: 1;
-        }}
-        
-        /* Dashboard */
         .dashboard-stats {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -457,30 +374,6 @@ def load_css():
             font-size: 0.85rem;
         }}
         
-        /* Responsive */
-        @media (max-width: 768px) {{
-            .hero-title {{
-                font-size: 2.5rem;
-            }}
-            .hero-subtitle {{
-                font-size: 1rem;
-            }}
-            .hero-buttons {{
-                flex-direction: column;
-                align-items: center;
-            }}
-            .features-grid {{
-                grid-template-columns: 1fr;
-            }}
-            .pricing-grid {{
-                grid-template-columns: 1fr;
-            }}
-            .stats-section {{
-                grid-template-columns: 1fr 1fr;
-            }}
-        }}
-        
-        /* User Avatar */
         .user-avatar {{
             width: 40px;
             height: 40px;
@@ -493,6 +386,45 @@ def load_css():
             font-weight: 600;
             font-size: 1.2rem;
         }}
+        
+        .plan-badge {{
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }}
+        
+        .plan-free {{
+            background: #e2e8f0;
+            color: #475569;
+        }}
+        
+        .plan-pro {{
+            background: #2563EB;
+            color: white;
+        }}
+        
+        .plan-enterprise {{
+            background: #7C3AED;
+            color: white;
+        }}
+        
+        @media (max-width: 768px) {{
+            .hero-title {{
+                font-size: 2.5rem;
+            }}
+            .hero-subtitle {{
+                font-size: 1rem;
+            }}
+            .features-grid {{
+                grid-template-columns: 1fr;
+            }}
+            .stats-section {{
+                grid-template-columns: 1fr 1fr;
+            }}
+        }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -503,12 +435,16 @@ load_css()
 # ============================================
 API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Initialize Gemini client
 try:
     if API_KEY:
         client = genai.Client(api_key=API_KEY)
+    else:
+        client = None
 except Exception as e:
     client = None
+
+def get_db():
+    return SessionLocal()
 
 # ============================================
 # LANDING PAGE
@@ -523,18 +459,9 @@ def landing_page():
             Transform your meetings into actionable intelligence with AI-powered summarization.
             Save hours, capture decisions, and never miss an action item again.
         </div>
-        <div class="hero-buttons">
-            <button class="primary-btn" onclick="document.querySelector('[data-testid=baseButton-secondary]').click()">
-                🚀 Get Started Free
-            </button>
-            <button class="secondary-btn" onclick="document.querySelector('[data-testid=baseButton-secondary]').click()">
-                🎥 Watch Demo
-            </button>
-        </div>
     </div>
     """, unsafe_allow_html=True)
     
-    # Stats Section
     st.markdown("""
     <div class="stats-section">
         <div class="stat-item">
@@ -556,7 +483,6 @@ def landing_page():
     </div>
     """, unsafe_allow_html=True)
     
-    # Features Section
     st.markdown("## 🚀 Why Choose Meeting Summarizer Pro?")
     st.markdown("""
     <div class="features-grid">
@@ -593,90 +519,75 @@ def landing_page():
     </div>
     """, unsafe_allow_html=True)
     
-    # Testimonials
-    st.markdown("## 💬 What Our Users Say")
-    st.markdown("""
-    <div class="testimonial-section">
-        <div class="testimonial-grid">
-            <div class="testimonial-card">
-                <div class="quote">"This tool saved our team 10+ hours per week. We never miss action items anymore!"</div>
-                <div class="author">Sarah Johnson</div>
-                <div class="role">Product Manager, TechCorp</div>
-            </div>
-            <div class="testimonial-card">
-                <div class="quote">"The accuracy is incredible. Even with background noise, the summaries are perfect."</div>
-                <div class="author">Michael Chen</div>
-                <div class="role">CTO, StartupHub</div>
-            </div>
-            <div class="testimonial-card">
-                <div class="quote">"I use it for all my client meetings. It's like having a personal assistant!"</div>
-                <div class="author">Emily Rodriguez</div>
-                <div class="role">Consultant, Global Partners</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Pricing Section
-    st.markdown("## 💎 Simple Pricing")
-    st.markdown("""
-    <div class="pricing-grid">
-        <div class="pricing-card">
-            <div class="plan-name">Free</div>
-            <div class="price">$0 <span>/month</span></div>
-            <ul>
-                <li>5 meetings per month</li>
-                <li>Audio upload up to 10MB</li>
-                <li>Text transcript summarization</li>
-                <li>Basic export options</li>
-            </ul>
-            <button class="primary-btn" style="width:100%;">Get Started</button>
-        </div>
-        <div class="pricing-card featured">
-            <div class="plan-name">Pro</div>
-            <div class="price">$29 <span>/month</span></div>
-            <ul>
-                <li>Unlimited meetings</li>
-                <li>Audio upload up to 100MB</li>
-                <li>Advanced summarization</li>
-                <li>Export all formats</li>
-                <li>Priority support</li>
-            </ul>
-            <button class="primary-btn" style="width:100%;background:#2563EB;">Try Pro Free</button>
-        </div>
-        <div class="pricing-card">
-            <div class="plan-name">Enterprise</div>
-            <div class="price">Custom</div>
-            <ul>
-                <li>All Pro features</li>
-                <li>Team collaboration</li>
-                <li>Custom integrations</li>
-                <li>Dedicated support</li>
-                <li>SLA guarantee</li>
-            </ul>
-            <button class="primary-btn" style="width:100%;">Contact Sales</button>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # CTA Section
-    st.markdown("""
-    <div style="text-align:center;background:linear-gradient(135deg,#667eea,#764ba2);padding:3rem 2rem;border-radius:16px;margin:2rem 0;">
-        <h2 style="color:white;font-size:2rem;margin-bottom:0.5rem;">Ready to Transform Your Meetings?</h2>
-        <p style="color:rgba(255,255,255,0.9);font-size:1.1rem;margin-bottom:1.5rem;">
-            Join thousands of professionals who use Meeting Summarizer Pro daily.
-        </p>
-        <button class="primary-btn" onclick="document.querySelector('[data-testid=baseButton-secondary]').click()" 
-                style="background:white;color:#667eea !important;font-size:1.1rem;padding:0.8rem 3rem;">
-            🚀 Get Started Free
-        </button>
-    </div>
-    """, unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🚀 Sign Up Free", type="primary", use_container_width=True):
+                st.session_state.page = "signup"
+                st.rerun()
+        with col_b:
+            if st.button("🔑 Sign In", use_container_width=True):
+                st.session_state.page = "login"
+                st.rerun()
 
 # ============================================
-# AUTHENTICATION
+# SIGN UP PAGE
 # ============================================
-def auth_page():
+def signup_page():
+    st.markdown("""
+    <div class="auth-modal">
+        <div style="text-align:center;margin-bottom:1rem;">
+            <span style="font-size:3rem;">🎙️</span>
+        </div>
+        <div class="auth-title">Create Account</div>
+        <div class="auth-subtitle">Start your free trial today</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("signup_form"):
+            full_name = st.text_input("Full Name", placeholder="John Doe")
+            email = st.text_input("Email", placeholder="john@example.com")
+            username = st.text_input("Username", placeholder="johndoe")
+            password = st.text_input("Password", type="password", placeholder="Min 8 characters")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                submit = st.form_submit_button("Create Account", type="primary", use_container_width=True)
+            with col_b:
+                if st.form_submit_button("← Back", use_container_width=True):
+                    st.session_state.page = "landing"
+                    st.rerun()
+            
+            if submit:
+                if not all([full_name, email, username, password]):
+                    st.error("Please fill in all fields")
+                elif password != confirm_password:
+                    st.error("Passwords do not match")
+                elif len(password) < 8:
+                    st.error("Password must be at least 8 characters")
+                else:
+                    db = get_db()
+                    existing_user = get_user_by_email(db, email)
+                    if existing_user:
+                        st.error("Email already registered. Please sign in.")
+                    else:
+                        try:
+                            user = create_user(db, email, username, password, full_name)
+                            st.success("Account created successfully! Please sign in.")
+                            st.session_state.page = "login"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error creating account: {str(e)}")
+                    db.close()
+
+# ============================================
+# LOGIN PAGE
+# ============================================
+def login_page():
     st.markdown("""
     <div class="auth-modal">
         <div style="text-align:center;margin-bottom:1rem;">
@@ -684,83 +595,93 @@ def auth_page():
         </div>
         <div class="auth-title">Welcome Back</div>
         <div class="auth-subtitle">Sign in to access your meeting summaries</div>
-        
-        <button class="google-btn">
-            <svg width="20" height="20" viewBox="0 0 48 48">
-                <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z"/>
-                <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z"/>
-                <path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.025C9.505,39.556,16.227,44,24,44z"/>
-                <path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z"/>
-            </svg>
-            Sign in with Google
-        </button>
-        
-        <div class="divider"><span>or continue with email</span></div>
-        
-        <div style="margin-top:1rem;">
-            <input type="email" placeholder="Email address" 
-                   style="width:100%;padding:0.8rem;border:2px solid #E2E8F0;border-radius:8px;margin-bottom:0.5rem;font-size:1rem;">
-            <input type="password" placeholder="Password" 
-                   style="width:100%;padding:0.8rem;border:2px solid #E2E8F0;border-radius:8px;margin-bottom:1rem;font-size:1rem;">
-            <button style="width:100%;padding:0.8rem;background:#2563EB;color:white;border:none;border-radius:8px;font-weight:600;font-size:1rem;cursor:pointer;">
-                Sign In
-            </button>
-        </div>
-        
-        <div style="text-align:center;margin-top:1rem;color:#64748B;font-size:0.9rem;">
-            Don't have an account? <a href="#" style="color:#2563EB;text-decoration:none;font-weight:600;">Sign up free</a>
-        </div>
     </div>
     """, unsafe_allow_html=True)
     
-    # Simple email/password auth for demo
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="john@example.com")
+            password = st.text_input("Password", type="password", placeholder="Enter your password")
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                submit = st.form_submit_button("Sign In", type="primary", use_container_width=True)
+            with col_b:
+                if st.form_submit_button("← Back", use_container_width=True):
+                    st.session_state.page = "landing"
+                    st.rerun()
+            
+            if submit:
+                if not email or not password:
+                    st.error("Please enter both email and password")
+                else:
+                    db = get_db()
+                    user = authenticate_user(db, email, password)
+                    if user:
+                        st.session_state.authenticated = True
+                        st.session_state.user_id = user.id
+                        st.session_state.user_email = user.email
+                        st.session_state.user_name = user.full_name or user.username
+                        st.session_state.user_plan = user.plan
+                        st.session_state.token = create_jwt_token(user.id, user.email)
+                        st.session_state.page = "dashboard"
+                        st.rerun()
+                    else:
+                        st.error("Invalid email or password")
+                    db.close()
+        
         st.markdown("---")
-        st.markdown("### 🔑 Demo Login")
-        email = st.text_input("Email", placeholder="demo@example.com")
-        password = st.text_input("Password", type="password", placeholder="password")
-        
-        if st.button("Sign In", type="primary", use_container_width=True):
-            if email and password:
-                st.session_state.authenticated = True
-                st.session_state.user_email = email
-                st.session_state.user_name = email.split('@')[0].title()
-                st.session_state.page = "dashboard"
-                st.rerun()
-            else:
-                st.error("Please enter email and password")
-        
-        st.caption("💡 Demo: Use any email and password to try the app")
+        st.markdown("Don't have an account? **Sign up** above!")
 
 # ============================================
 # DASHBOARD PAGE
 # ============================================
 def dashboard_page():
-    # User greeting
+    db = get_db()
+    user = get_user_by_id(db, st.session_state.user_id)
+    
+    if not user:
+        st.error("User not found. Please sign in again.")
+        st.session_state.authenticated = False
+        st.rerun()
+        return
+    
+    plan_colors = {
+        "free": "plan-free",
+        "pro": "plan-pro",
+        "enterprise": "plan-enterprise"
+    }
+    plan_class = plan_colors.get(user.plan, "plan-free")
+    
     st.markdown(f"""
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;">
         <div>
-            <h1 style="font-size:2rem;font-weight:700;color:#0F172A;">👋 Welcome, {st.session_state.user_name}</h1>
+            <h1 style="font-size:2rem;font-weight:700;color:#0F172A;">👋 Welcome, {user.full_name or user.username}</h1>
             <p style="color:#64748B;">Here's your meeting summary dashboard</p>
         </div>
-        <div class="user-avatar">{st.session_state.user_name[0].upper()}</div>
+        <div style="display:flex;align-items:center;gap:1rem;">
+            <span class="plan-badge {plan_class}">{user.plan.upper()}</span>
+            <div class="user-avatar">{user.username[0].upper()}</div>
+        </div>
     </div>
     """, unsafe_allow_html=True)
     
-    # Dashboard Stats
+    summaries = db.query(Summary).filter(Summary.user_id == user.id).all()
+    summary_count = len(summaries)
+    
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.markdown(f"""
         <div class="dashboard-stat">
-            <span class="number">{st.session_state.meeting_count}</span>
+            <span class="number">{summary_count}</span>
             <span class="label">Total Meetings</span>
         </div>
         """, unsafe_allow_html=True)
     with col2:
         st.markdown(f"""
         <div class="dashboard-stat">
-            <span class="number">{len(st.session_state.summary_history)}</span>
+            <span class="number">{len([s for s in summaries if s.summary])}</span>
             <span class="label">Summaries Generated</span>
         </div>
         """, unsafe_allow_html=True)
@@ -772,20 +693,18 @@ def dashboard_page():
         </div>
         """, unsafe_allow_html=True)
     with col4:
-        st.markdown("""
+        st.markdown(f"""
         <div class="dashboard-stat">
-            <span class="number">🎯</span>
-            <span class="label">Pro Plan</span>
+            <span class="number">{user.plan.upper()}</span>
+            <span class="label">Current Plan</span>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown("---")
     
-    # Main App Tabs
-    tab1, tab2, tab3 = st.tabs(["🎙️ New Summary", "📚 History", "⚙️ Settings"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🎙️ New Summary", "📚 History", "👤 Profile", "⚙️ Settings"])
     
     with tab1:
-        # MIME types for audio
         MIME_TYPES = {
             ".mp3": "audio/mpeg",
             ".wav": "audio/wav",
@@ -824,6 +743,7 @@ def dashboard_page():
                     <h4 style="color:#16A34A;margin:0 0 0.25rem 0;">✅ File Uploaded Successfully</h4>
                     <p style="margin:0;"><strong>📁 File:</strong> {uploaded_file.name}</p>
                     <p style="margin:0;"><strong>📊 Size:</strong> {file_size_kb:.2f} KB</p>
+                    <p style="margin:0;"><strong>🔤 Format:</strong> {file_extension.upper()}</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -914,14 +834,20 @@ def dashboard_page():
                                 status_text.text("✅ Summary generated successfully!")
                                 
                                 summary = response.text
+                                
+                                new_summary = Summary(
+                                    user_id=user.id,
+                                    title=uploaded_file.name,
+                                    summary=summary,
+                                    audio_filename=uploaded_file.name,
+                                    file_type="audio",
+                                    created_at=datetime.utcnow()
+                                )
+                                db.add(new_summary)
+                                db.commit()
+                                db.refresh(new_summary)
+                                
                                 st.session_state.current_summary = summary
-                                st.session_state.meeting_count += 1
-                                st.session_state.summary_history.append({
-                                    "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                    "name": uploaded_file.name,
-                                    "type": "Audio",
-                                    "summary": summary[:200] + "..."
-                                })
                                 
                                 st.markdown("---")
                                 st.markdown("## 📋 Meeting Summary")
@@ -948,7 +874,7 @@ def dashboard_page():
                                     )
                                 
                                 st.balloons()
-                                st.success("🎉 Summary generated successfully!")
+                                st.success("🎉 Summary generated and saved successfully!")
                                 
                             except Exception as e:
                                 st.error(f"❌ Error: {str(e)}")
@@ -1038,14 +964,19 @@ Action Items:
                             )
                             summary = response.text
                             
+                            new_summary = Summary(
+                                user_id=user.id,
+                                title="Text Transcript Summary",
+                                transcript=transcript,
+                                summary=summary,
+                                file_type="text",
+                                created_at=datetime.utcnow()
+                            )
+                            db.add(new_summary)
+                            db.commit()
+                            db.refresh(new_summary)
+                            
                             st.session_state.current_summary = summary
-                            st.session_state.meeting_count += 1
-                            st.session_state.summary_history.append({
-                                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                "name": "Transcript",
-                                "type": "Text",
-                                "summary": summary[:200] + "..."
-                            })
                             
                             st.markdown("---")
                             st.markdown("## 📋 Meeting Summary")
@@ -1072,7 +1003,7 @@ Action Items:
                                 )
                             
                             st.balloons()
-                            st.success("🎉 Summary generated successfully!")
+                            st.success("🎉 Summary generated and saved successfully!")
                             
                         except Exception as e:
                             st.error(f"❌ Error: {str(e)}")
@@ -1080,27 +1011,55 @@ Action Items:
     with tab2:
         st.markdown("### 📚 Summary History")
         
-        if st.session_state.summary_history:
-            history_df = pd.DataFrame(st.session_state.summary_history)
-            st.dataframe(
-                history_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "date": "Date",
-                    "name": "File Name",
-                    "type": "Type",
-                    "summary": "Preview"
-                }
-            )
+        if summaries:
+            data = []
+            for s in summaries:
+                data.append({
+                    "Date": s.created_at.strftime("%Y-%m-%d %H:%M"),
+                    "Title": s.title or "Untitled",
+                    "Type": s.file_type or "Unknown",
+                    "Preview": s.summary[:100] + "..." if s.summary else "No summary"
+                })
             
-            if st.button("🗑️ Clear History"):
-                st.session_state.summary_history = []
+            st.markdown("| Date | Title | Type | Preview |")
+            st.markdown("|------|-------|------|---------|")
+            for row in data:
+                st.markdown(f"| {row['Date']} | {row['Title']} | {row['Type']} | {row['Preview']} |")
+            
+            if st.button("🗑️ Clear All History"):
+                db.query(Summary).filter(Summary.user_id == user.id).delete()
+                db.commit()
                 st.rerun()
         else:
-            st.info("No summaries generated yet. Start by creating your first summary!")
+            st.info("No summaries yet. Start by creating your first summary!")
     
     with tab3:
+        st.markdown("### 👤 Profile Settings")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### Personal Information")
+            new_full_name = st.text_input("Full Name", value=user.full_name or "")
+            new_username = st.text_input("Username", value=user.username)
+            
+            if st.button("Update Profile"):
+                if new_full_name:
+                    user.full_name = new_full_name
+                if new_username:
+                    user.username = new_username
+                db.commit()
+                st.success("Profile updated successfully!")
+                st.rerun()
+        
+        with col2:
+            st.markdown("#### Account Details")
+            st.write(f"**Email:** {user.email}")
+            st.write(f"**Plan:** {user.plan.upper()}")
+            st.write(f"**Member Since:** {user.created_at.strftime('%B %d, %Y')}")
+            st.write(f"**Total Summaries:** {len(summaries)}")
+    
+    with tab4:
         st.markdown("### ⚙️ Settings")
         
         col1, col2 = st.columns(2)
@@ -1114,41 +1073,89 @@ Action Items:
                 st.info("Add GEMINI_API_KEY to your .env file")
         
         with col2:
-            st.markdown("#### 👤 Profile")
-            st.write(f"**Name:** {st.session_state.user_name}")
-            st.write(f"**Email:** {st.session_state.user_email}")
-            st.write(f"**Plan:** Pro")
+            st.markdown("#### 🔐 Security")
+            if st.button("Change Password"):
+                st.session_state.page = "change_password"
+                st.rerun()
         
         st.markdown("---")
-        st.markdown("#### 🎨 Theme Preferences")
-        theme = st.selectbox("Theme", ["Light", "Dark"], index=0)
-        st.caption("💡 Dark theme coming soon!")
-        
-        st.markdown("---")
-        if st.button("🚪 Sign Out", type="secondary"):
+        if st.button("🚪 Sign Out", type="secondary", use_container_width=True):
             st.session_state.authenticated = False
+            st.session_state.user_id = None
             st.session_state.user_email = None
             st.session_state.user_name = None
+            st.session_state.token = None
             st.session_state.page = "landing"
+            db.close()
             st.rerun()
+    
+    db.close()
+
+# ============================================
+# CHANGE PASSWORD PAGE
+# ============================================
+def change_password_page():
+    st.markdown("""
+    <div class="auth-modal">
+        <div style="text-align:center;margin-bottom:1rem;">
+            <span style="font-size:3rem;">🔐</span>
+        </div>
+        <div class="auth-title">Change Password</div>
+        <div class="auth-subtitle">Update your account password</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        db = get_db()
+        user = get_user_by_id(db, st.session_state.user_id)
+        
+        with st.form("change_password_form"):
+            current_password = st.text_input("Current Password", type="password")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm New Password", type="password")
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                submit = st.form_submit_button("Update Password", type="primary", use_container_width=True)
+            with col_b:
+                if st.form_submit_button("← Back", use_container_width=True):
+                    st.session_state.page = "dashboard"
+                    st.rerun()
+            
+            if submit:
+                if not current_password or not new_password:
+                    st.error("Please fill in all fields")
+                elif new_password != confirm_password:
+                    st.error("New passwords do not match")
+                elif len(new_password) < 8:
+                    st.error("Password must be at least 8 characters")
+                elif not verify_password(current_password, user.password_hash):
+                    st.error("Current password is incorrect")
+                else:
+                    user.password_hash = hash_password(new_password)
+                    db.commit()
+                    st.success("Password updated successfully!")
+                    st.session_state.page = "dashboard"
+                    st.rerun()
+        
+        db.close()
 
 # ============================================
 # MAIN APP LOGIC
 # ============================================
 def main():
-    # Check authentication
     if st.session_state.page == "landing" and not st.session_state.authenticated:
         landing_page()
-        
-        # Hidden auth trigger
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
-            if st.button("🚀 Get Started", type="primary", use_container_width=True):
-                st.session_state.page = "auth"
-                st.rerun()
     
-    elif st.session_state.page == "auth" and not st.session_state.authenticated:
-        auth_page()
+    elif st.session_state.page == "signup" and not st.session_state.authenticated:
+        signup_page()
+    
+    elif st.session_state.page == "login" and not st.session_state.authenticated:
+        login_page()
+    
+    elif st.session_state.page == "change_password" and st.session_state.authenticated:
+        change_password_page()
     
     elif st.session_state.authenticated:
         dashboard_page()
