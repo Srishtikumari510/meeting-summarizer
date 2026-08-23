@@ -1,4 +1,4 @@
-  🎙️ Meeting Summarizer Pro 
+  🎙️ Meeting Summarizer Pro (https://meeting-summarizer-lwr4emjcbw5kjssw765qbr.streamlit.app/)
 
   
 
