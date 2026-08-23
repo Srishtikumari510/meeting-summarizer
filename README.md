@@ -5,7 +5,7 @@
 > AI-powered meeting summarization using Google Gemini AI with a modern, accessible UI 
 
   
-
+[![Live Demo](https://img.shields.io/badge/Live_Demo-Streamlit_Cloud-FF4B4B?style=for-the-badge&logo=streamlit)](https://meeting-summarizer-lwr4emjcbw5kjssw765qbr.streamlit.app/)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org) 
 
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.62.0-red.svg)](https://streamlit.io) 
